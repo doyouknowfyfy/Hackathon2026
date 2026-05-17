@@ -36,6 +36,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 from ts_embed.data import (
+    ChunkedIterableDataset,
     ContrastiveCollator,
     DatasetPaths,
     TimeFeatureMasker,
@@ -70,6 +71,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--lr-scale-batches", action="store_true", default=True,
                    help="linear-scale base LR by world_size")
+    p.add_argument("--streaming", action="store_true",
+                   help="use ChunkedIterableDataset (memory-bounded contiguous "
+                        "reads) instead of random-access memmap indexing")
+    p.add_argument("--chunk-size", type=int, default=4096,
+                   help="rows held in RAM per worker when --streaming")
+    p.add_argument("--prefetch-factor", type=int, default=2,
+                   help="DataLoader prefetch batches per worker (lower = less RAM)")
+    p.add_argument("--empty-cache-every", type=int, default=0,
+                   help="call torch.cuda.empty_cache() every N steps (0 = never)")
     return p.parse_args()
 
 
@@ -109,25 +119,41 @@ def main() -> None:
     dist.barrier()
 
     paths = DatasetPaths(numeric=args.numeric, missing=args.missing, categorical=args.categorical)
-    dataset = TimeSeriesDataset(paths)
-    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True,
-                                 drop_last=True, seed=args.seed)
-
     masker = TimeFeatureMasker(
         time_mask_prob=args.time_mask_prob,
         feature_mask_prob=args.feature_mask_prob,
     )
     collator = ContrastiveCollator(masker)
-    loader = DataLoader(
-        dataset,
+
+    global_batch = args.batch_size * world_size
+    common_loader_kw = dict(
         batch_size=args.batch_size,
-        sampler=sampler,
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True,
         persistent_workers=args.num_workers > 0,
         collate_fn=collator,
     )
+    if args.num_workers > 0:
+        common_loader_kw["prefetch_factor"] = args.prefetch_factor
+
+    if args.streaming:
+        # IterableDataset shards internally by (rank, worker) and frees each
+        # contiguous chunk after it is consumed -> peak host RAM bounded by
+        # chunk_size, not by N. No DistributedSampler.
+        dataset = ChunkedIterableDataset(
+            paths, chunk_size=args.chunk_size, shuffle=True, seed=args.seed,
+            rank=rank, world_size=world_size,
+        )
+        sampler = None
+        steps_per_epoch = dataset.steps_per_epoch(global_batch)
+        loader = DataLoader(dataset, **common_loader_kw)
+    else:
+        dataset = TimeSeriesDataset(paths)
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank,
+                                     shuffle=True, drop_last=True, seed=args.seed)
+        loader = DataLoader(dataset, sampler=sampler, **common_loader_kw)
+        steps_per_epoch = len(loader)
 
     cfg = TSEncoderConfig(
         d_model=args.d_model,
@@ -144,7 +170,6 @@ def main() -> None:
 
     base_lr = args.lr * (world_size if args.lr_scale_batches else 1)
     optim = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=args.weight_decay)
-    steps_per_epoch = len(loader)
     total_steps = steps_per_epoch * args.epochs
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optim, lr_lambda=lambda s: cosine_warmup(s, args.warmup_steps, total_steps)
@@ -153,7 +178,10 @@ def main() -> None:
 
     step = 0
     for epoch in range(args.epochs):
-        sampler.set_epoch(epoch)
+        if sampler is not None:
+            sampler.set_epoch(epoch)
+        else:
+            dataset.set_epoch(epoch)  # reseed streaming chunk/sample shuffle
         model.train()
         t0 = time.time()
 
@@ -194,6 +222,12 @@ def main() -> None:
                     f"lr {lr:.2e}",
                     flush=True,
                 )
+            # Drop references so Python frees the host (pinned) staging buffers
+            # and CUDA frees the activation tensors before the next batch.
+            del num_a, mis_a, keep_a, num_b, mis_b, keep_b, cat_a, cat_b
+            del z_a, z_b, losses, batch
+            if args.empty_cache_every and step % args.empty_cache_every == 0:
+                torch.cuda.empty_cache()
             step += 1
 
         if is_main(rank) and (epoch + 1) % args.ckpt_every == 0:

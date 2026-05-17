@@ -20,7 +20,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
 
 @dataclass
@@ -62,6 +62,108 @@ class TimeSeriesDataset(Dataset):
                 np.asarray(self.categorical[idx], dtype=np.int64)
             )
         return item
+
+
+class ChunkedIterableDataset(IterableDataset):
+    """Memory-bounded streaming dataset for >3M accounts on CPU-constrained hosts.
+
+    Why not the random-access ``TimeSeriesDataset``? Random indexing into a
+    ~28 GB memmap pulls scattered 4 KB pages into the OS page cache; under many
+    DataLoader workers the resident set grows until the box thrashes. This
+    dataset instead reads **contiguous chunks**, yields the samples in that
+    chunk, then ``del``s the chunk so its RAM is reclaimed before the next one.
+    Peak host memory per worker is bounded by ``chunk_size`` (not by N).
+
+    Sharding for GPU clusters
+    -------------------------
+    The global index range is split into ``world_size`` contiguous rank shards,
+    then each rank's chunks are round-robin'd across its DataLoader workers.
+    Every (rank, worker) pair therefore sees a disjoint slice with no
+    DistributedSampler needed. Call ``set_epoch`` each epoch so the chunk /
+    in-chunk shuffle reseeds.
+    """
+
+    def __init__(
+        self,
+        paths: DatasetPaths,
+        chunk_size: int = 4096,
+        shuffle: bool = True,
+        seed: int = 0,
+        rank: int = 0,
+        world_size: int = 1,
+        seq_len: int = 24,
+        n_numeric: int = 98,
+    ):
+        super().__init__()
+        self.paths = paths
+        self.chunk_size = chunk_size
+        self.shuffle = shuffle
+        self.seed = seed
+        self.rank = rank
+        self.world_size = world_size
+        self.epoch = 0
+
+        # Read the header only (no data) to learn N; don't keep the mmap open
+        # across a fork — workers reopen it in __iter__.
+        head = np.load(paths.numeric, mmap_mode="r")
+        n, t, f = head.shape
+        assert t == seq_len and f == n_numeric, "shape mismatch vs config"
+        self.n = n
+        del head
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def steps_per_epoch(self, global_batch_size: int) -> int:
+        return self.n // global_batch_size
+
+    def _rank_range(self) -> tuple[int, int]:
+        per = self.n // self.world_size
+        start = self.rank * per
+        end = self.n if self.rank == self.world_size - 1 else start + per
+        return start, end
+
+    def __iter__(self):
+        # Open memmaps inside the worker process (post-fork) so pages aren't
+        # shared/retained from the parent.
+        numeric = np.load(self.paths.numeric, mmap_mode="r")
+        missing = np.load(self.paths.missing, mmap_mode="r")
+        categorical = (
+            np.load(self.paths.categorical, mmap_mode="r")
+            if self.paths.categorical else None
+        )
+
+        info = get_worker_info()
+        wid, nworkers = (0, 1) if info is None else (info.id, info.num_workers)
+
+        r_start, r_end = self._rank_range()
+        starts = list(range(r_start, r_end, self.chunk_size))
+        rng = np.random.default_rng(self.seed + self.epoch)
+        if self.shuffle:
+            rng.shuffle(starts)
+        starts = starts[wid::nworkers]  # this worker's chunks
+
+        for s in starts:
+            e = min(s + self.chunk_size, r_end)
+            b_num = np.asarray(numeric[s:e], dtype=np.float32)
+            b_mis = np.asarray(missing[s:e], dtype=np.float32)
+            b_cat = (
+                np.asarray(categorical[s:e], dtype=np.int64)
+                if categorical is not None else None
+            )
+            order = np.arange(e - s)
+            if self.shuffle:
+                rng.shuffle(order)
+            for i in order:
+                item = {
+                    "numeric": torch.from_numpy(b_num[i].copy()),
+                    "missing": torch.from_numpy(b_mis[i].copy()),
+                }
+                if b_cat is not None:
+                    item["categorical"] = torch.from_numpy(b_cat[i].copy())
+                yield item
+            # Reclaim the chunk's RAM before reading the next one.
+            del b_num, b_mis, b_cat
 
 
 class TimeFeatureMasker:
