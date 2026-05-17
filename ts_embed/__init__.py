@@ -1,5 +1,5 @@
 from .model import TSEncoder, ProjectionHead, TSEmbeddingModel
-from .loss import VICRegLoss
+from .loss import VICRegLoss, VICRegConfig, AspectContrastiveLoss, AspectSpec, supcon_loss
 from .data import (
     TimeSeriesDataset,
     ChunkedIterableDataset,
@@ -12,6 +12,10 @@ __all__ = [
     "ProjectionHead",
     "TSEmbeddingModel",
     "VICRegLoss",
+    "VICRegConfig",
+    "AspectContrastiveLoss",
+    "AspectSpec",
+    "supcon_loss",
     "TimeSeriesDataset",
     "ChunkedIterableDataset",
     "ContrastiveCollator",
