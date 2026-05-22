@@ -42,8 +42,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-layers", type=int, default=4)
     p.add_argument("--n-heads", type=int, default=6)
     p.add_argument("--proj-dim", type=int, default=256)
-    p.add_argument("--time-mask-prob", type=float, default=0.25)
-    p.add_argument("--feature-mask-prob", type=float, default=0.30)
+    p.add_argument("--time-mask-prob", type=float, default=0.25,
+                   help="fraction of months hidden, as contiguous spans")
+    p.add_argument("--feature-mask-prob", type=float, default=0.30,
+                   help="fraction of feature channels span-masked")
+    p.add_argument("--n-time-spans", type=int, default=2,
+                   help="number of contiguous month spans to hide")
+    p.add_argument("--feat-span-frac", type=float, default=0.5,
+                   help="length of a masked feature channel's time window (frac of T)")
+    p.add_argument("--jitter-std", type=float, default=0.0,
+                   help="Gaussian noise std on numeric values (0 = off)")
     p.add_argument("--amp", action="store_true", default=True)
     p.add_argument("--no-amp", dest="amp", action="store_false")
     p.add_argument("--log-every", type=int, default=50)
@@ -76,6 +84,9 @@ def main() -> None:
     masker = TimeFeatureMasker(
         time_mask_prob=args.time_mask_prob,
         feature_mask_prob=args.feature_mask_prob,
+        n_time_spans=args.n_time_spans,
+        feat_span_frac=args.feat_span_frac,
+        jitter_std=args.jitter_std,
     )
     collator = ContrastiveCollator(masker)
     loader = DataLoader(
