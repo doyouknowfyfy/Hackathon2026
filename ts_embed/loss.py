@@ -355,3 +355,55 @@ class StructuredContrastiveLoss(nn.Module):
             + self.var_weight * var
         )
         return out
+
+
+# ---------------------------------------------------------------------------
+# Target-supervised contrastive loss
+# ---------------------------------------------------------------------------
+class SupConLoss(nn.Module):
+    """Supervised contrastive loss over the full embedding, guided by the
+    downstream target label.
+
+    Samples with the SAME target label are positives (pulled together);
+    DIFFERENT labels are negatives (pushed apart). The two augmented
+    (masked / unmasked) views of a sample are also forced to be mutual
+    positives, so the encoder learns augmentation-invariance and
+    target-discrimination from a single objective. Built on `supcon_loss`
+    (Khosla et al. 2020).
+
+    Unlike VICReg, SupCon does not need a separate anti-collapse term: the
+    push-apart between different-label samples keeps the embedding spread out.
+    """
+
+    def __init__(self, in_dim: int, proj_dim: int = 128, proj_hidden: int = 256,
+                 temperature: float = 0.1):
+        super().__init__()
+        self.temperature = temperature
+        # BatchNorm in the projector follows standard SimCLR/SupCon practice and
+        # matters for contrastive performance.
+        self.proj = nn.Sequential(
+            nn.Linear(in_dim, proj_hidden),
+            nn.BatchNorm1d(proj_hidden),
+            nn.GELU(),
+            nn.Linear(proj_hidden, proj_dim),
+        )
+
+    def forward(
+        self,
+        emb_a: torch.Tensor,
+        emb_b: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """emb_a / emb_b : (B, in_dim) encoder embeddings of the two views.
+        labels : (B,) integer target labels."""
+        b = emb_a.size(0)
+        fa = F.normalize(self.proj(emb_a), dim=-1)
+        fb = F.normalize(self.proj(emb_b), dim=-1)
+        feats = torch.cat([fa, fb], dim=0)  # (2B, proj_dim)
+
+        # Same-label pairs are positives. A batch with a single label gives an
+        # all-positive mask (a weak, no-op step but not an error); use a
+        # class-balanced sampler so that is vanishingly rare.
+        base = labels.unsqueeze(0) == labels.unsqueeze(1)  # (B, B)
+        pm = _stacked_pos_mask(base, b)
+        return {"loss": supcon_loss(feats, pm, self.temperature)}
