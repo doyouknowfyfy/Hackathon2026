@@ -407,3 +407,140 @@ class SupConLoss(nn.Module):
         base = labels.unsqueeze(0) == labels.unsqueeze(1)  # (B, B)
         pm = _stacked_pos_mask(base, b)
         return {"loss": supcon_loss(feats, pm, self.temperature)}
+
+
+# ---------------------------------------------------------------------------
+# Aspect-specific augmentation contrastive loss
+# ---------------------------------------------------------------------------
+"""Fixed-partitioned semantic embeddings via aspect-specific augmentations.
+
+Idea: each chunk should be invariant to perturbations of features that belong
+to OTHER aspects, while remaining sensitive to perturbations of its OWN
+aspect's features. The result is a fixed partitioning where each chunk is
+*structurally* tied to its semantic -- no clustering labels needed.
+
+How it works. For each aspect g, build a "g-preserving" view of the input
+where features outside g have been perturbed (masked / shuffled / noised) and
+features inside g are intact. Run the encoder on:
+  - the anchor view (all features intact), and
+  - one g-preserving view per aspect g.
+
+For chunk g, apply an InfoNCE / NT-Xent loss between the (anchor, g-preserving)
+pair: positives = same customer across the two views; negatives = other
+customers in the batch.
+
+Why this pins chunk g to aspect g's features:
+- Positives differ ONLY in non-g features -> the contrastive force makes chunk
+  g invariant to those.
+- Negatives differ in g's own features -> chunk g must be DIFFERENT for them,
+  i.e. discriminative over g-aspect content.
+Both forces together select for "chunk g encodes g's features specifically".
+
+Optional cross-chunk decorrelation and per-chunk variance hinge keep the chunks
+distinct and prevent dimensional collapse.
+
+The augmentation lives in `ts_embed.data.aspect_preserving_view`; this loss
+operates on the resulting encoder embeddings only.
+"""
+
+
+class AspectAugContrastiveLoss(nn.Module):
+    def __init__(
+        self,
+        aspects: list[AspectSpec],
+        decorr_weight: float = 0.5,
+        var_weight: float = 0.0,
+        var_gamma: float = 1.0,
+        var_eps: float = 1e-4,
+    ):
+        super().__init__()
+        self.specs = {a.name: a for a in aspects}
+        self.decorr_weight = decorr_weight
+        self.var_weight = var_weight
+        self.var_gamma = var_gamma
+        self.var_eps = var_eps
+        self.heads = nn.ModuleDict()
+        for s in aspects:
+            cdim = s.end - s.start
+            self.heads[s.name] = nn.Sequential(
+                nn.Linear(cdim, s.proj_hidden),
+                nn.BatchNorm1d(s.proj_hidden),
+                nn.GELU(),
+                nn.Linear(s.proj_hidden, s.proj_dim),
+            )
+
+    @staticmethod
+    def _zscore(x: torch.Tensor, eps: float) -> torch.Tensor:
+        return (x - x.mean(0, keepdim=True)) / (x.std(0, keepdim=True) + eps)
+
+    def forward(
+        self,
+        emb_anchor: torch.Tensor,
+        emb_per_aspect: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        """
+        emb_anchor      : (B, d_model) -- encoder embedding of the anchor view.
+        emb_per_aspect  : dict[name -> (B, d_model)] -- encoder embedding of
+                          each aspect's *preserving* view (features outside
+                          that aspect have been perturbed).
+        """
+        b = emb_anchor.size(0)
+        device = emb_anchor.device
+        out: dict[str, torch.Tensor] = {}
+        contrastive = emb_anchor.new_zeros(())
+
+        # Single-positive (NT-Xent) mask: only same-customer cross-view pairs.
+        pos_mask = torch.zeros(2 * b, 2 * b, dtype=torch.bool, device=device)
+        idx = torch.arange(b, device=device)
+        pos_mask[idx, idx + b] = True
+        pos_mask[idx + b, idx] = True
+
+        for name, s in self.specs.items():
+            if name not in emb_per_aspect:
+                raise KeyError(f"missing aspect '{name}' in emb_per_aspect")
+            anchor_g = emb_anchor[:, s.start:s.end]
+            aug_g = emb_per_aspect[name][:, s.start:s.end]
+            head = self.heads[name]
+            fa = F.normalize(head(anchor_g), dim=-1)
+            fb = F.normalize(head(aug_g), dim=-1)
+            feats = torch.cat([fa, fb], dim=0)            # (2B, proj_dim)
+            l = supcon_loss(feats, pos_mask, s.temperature)
+            out[f"c_{name}"] = l.detach()
+            contrastive = contrastive + s.weight * l
+
+        # Cross-chunk decorrelation on the anchor embedding -- pushes the
+        # fixed chunks to encode distinct (non-redundant) information.
+        names = list(self.specs)
+        decorr = emb_anchor.new_zeros(())
+        n_pairs = 0
+        zs = {
+            nm: self._zscore(
+                emb_anchor[:, self.specs[nm].start:self.specs[nm].end],
+                self.var_eps,
+            )
+            for nm in names
+        }
+        for i in range(len(names)):
+            for j in range(i + 1, len(names)):
+                zi, zj = zs[names[i]], zs[names[j]]
+                cross = (zi.t() @ zj) / max(b - 1, 1)
+                decorr = decorr + cross.pow(2).mean()
+                n_pairs += 1
+        decorr = decorr / max(n_pairs, 1)
+        out["decorr"] = decorr.detach()
+
+        # Per-chunk variance hinge (optional anti-collapse insurance).
+        var = emb_anchor.new_zeros(())
+        for nm in names:
+            s = self.specs[nm]
+            std = torch.sqrt(emb_anchor[:, s.start:s.end].var(0) + self.var_eps)
+            var = var + F.relu(self.var_gamma - std).mean()
+        var = var / max(len(names), 1)
+        out["var"] = var.detach()
+
+        out["loss"] = (
+            contrastive
+            + self.decorr_weight * decorr
+            + self.var_weight * var
+        )
+        return out
