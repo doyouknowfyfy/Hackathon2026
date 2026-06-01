@@ -167,14 +167,24 @@ class ChunkedIterableDataset(IterableDataset):
 
 
 class TimeFeatureMasker:
-    """Generates a masked "view" of an account for contrastive training.
+    """Generates a time-series-aware masked "view" of an account for contrastive
+    training.
 
-    Two independent masks:
-    - time_keep_mask : drops whole months. We pass it to the encoder as a
-      key_padding_mask so attention truly ignores those positions.
-    - feature_mask : zeroes individual numeric cells AND sets their missing
-      indicator to 1, so the encoder treats them like real missing values
-      (re-using the missing-handling pathway).
+    Three augmentations, all reusing the missing-data pathway (a masked numeric
+    cell is zeroed and its missing indicator set to 1, so the encoder treats it
+    exactly like a real missing value):
+
+    - time-span masking : hides whole CONTIGUOUS blocks of months. Scattered
+      single-month dropout is a weak signal for a sequence model -- it can copy
+      an adjacent month. Contiguous spans force reliance on longer-range
+      temporal context. Dropped months are removed from attention via the
+      encoder's key_padding_mask (the sequence is not cropped, so positional
+      encodings still reflect true month indices).
+    - feature-span masking : for a random subset of feature CHANNELS, hides a
+      contiguous time window of that channel (mimics a feature going dark for a
+      stretch of months), rather than scattered isolated cells.
+    - jitter (optional, off by default) : small Gaussian noise on the numeric
+      values; a standard, cheap time-series contrastive augmentation.
 
     Categorical features are kept intact in the masked view (only 2 binary
     cols, masking them out is too destructive).
@@ -184,37 +194,64 @@ class TimeFeatureMasker:
         self,
         time_mask_prob: float = 0.25,
         feature_mask_prob: float = 0.30,
+        n_time_spans: int = 2,
+        feat_span_frac: float = 0.5,
+        jitter_std: float = 0.0,
         min_kept_steps: int = 6,
     ):
         self.time_mask_prob = time_mask_prob
         self.feature_mask_prob = feature_mask_prob
+        self.n_time_spans = n_time_spans
+        self.feat_span_frac = feat_span_frac
+        self.jitter_std = jitter_std
         self.min_kept_steps = min_kept_steps
+
+    @staticmethod
+    def _span_lengths(total: int, n: int) -> list[int]:
+        """Split `total` masked months into `n` roughly-equal contiguous spans."""
+        n = max(1, min(n, total))
+        base, rem = divmod(total, n)
+        return [base + (1 if i < rem else 0) for i in range(n)]
 
     def __call__(self, numeric: torch.Tensor, missing: torch.Tensor) -> tuple[
         torch.Tensor, torch.Tensor, torch.Tensor
     ]:
         t, f = numeric.shape
+        numeric = numeric.clone()
+        missing = missing.clone()
 
-        # Feature-level mask
+        # Optional jitter on the numeric values.
+        if self.jitter_std > 0:
+            numeric = numeric + self.jitter_std * torch.randn_like(numeric)
+
+        # Feature-span masking: a contiguous time window per selected channel.
         if self.feature_mask_prob > 0:
-            feat_drop = torch.rand(t, f) < self.feature_mask_prob
-            numeric = numeric.clone()
-            missing = missing.clone()
-            numeric[feat_drop] = 0.0
-            missing[feat_drop] = 1.0
+            chan_drop = torch.nonzero(
+                torch.rand(f) < self.feature_mask_prob, as_tuple=False
+            ).flatten()
+            span = max(1, min(t, round(self.feat_span_frac * t)))
+            for c in chan_drop.tolist():
+                start = int(torch.randint(0, t - span + 1, (1,)))
+                numeric[start:start + span, c] = 0.0
+                missing[start:start + span, c] = 1.0
 
-        # Time-level mask, with a floor so we don't lose the whole sequence.
+        # Time-span masking: contiguous blocks of months, with a floor so we
+        # never lose the whole sequence.
+        time_keep = torch.ones(t)
         if self.time_mask_prob > 0:
-            time_drop = torch.rand(t) < self.time_mask_prob
-            # Ensure at least `min_kept_steps` survive.
-            kept = (~time_drop).sum().item()
-            if kept < self.min_kept_steps:
-                idx = torch.randperm(t)[: self.min_kept_steps]
-                time_drop = torch.ones(t, dtype=torch.bool)
-                time_drop[idx] = False
-            time_keep = (~time_drop).float()
-        else:
-            time_keep = torch.ones(t)
+            total = min(round(self.time_mask_prob * t), t - self.min_kept_steps)
+            if total > 0:
+                drop = torch.zeros(t, dtype=torch.bool)
+                for length in self._span_lengths(total, self.n_time_spans):
+                    if length <= 0:
+                        continue
+                    start = int(torch.randint(0, t - length + 1, (1,)))
+                    drop[start:start + length] = True
+                if int((~drop).sum()) < self.min_kept_steps:  # safety floor
+                    keep_idx = torch.randperm(t)[: self.min_kept_steps]
+                    drop = torch.ones(t, dtype=torch.bool)
+                    drop[keep_idx] = False
+                time_keep = (~drop).float()
 
         return numeric, missing, time_keep
 
@@ -224,7 +261,7 @@ class ContrastiveCollator:
 
     View A: no input masking (the "anchor" the user wants the masked view to
             match).
-    View B: time + feature masking applied by TimeFeatureMasker.
+    View B: time-span + feature-span masking applied by TimeFeatureMasker.
 
     Returns one dict with stacked tensors; both views are batched together so
     we only run the encoder once per view per step.

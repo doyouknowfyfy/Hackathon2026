@@ -198,3 +198,94 @@ class TSEmbeddingModel(nn.Module):
     def forward(self, numeric_x, missing_mask, cat_x=None, time_keep_mask=None):
         z = self.encode(numeric_x, missing_mask, cat_x, time_keep_mask)
         return z, self.projector(z)
+
+
+# ---------------------------------------------------------------------------
+# Downstream fine-tuning: encoder + classification head
+# ---------------------------------------------------------------------------
+def _strip_prefixes(state: dict) -> dict:
+    """Drop DDP / torch.compile key prefixes from a state_dict."""
+    return {
+        k.removeprefix("_orig_mod.").removeprefix("module."): v
+        for k, v in state.items()
+    }
+
+
+class ClassificationHead(nn.Module):
+    """MLP classification head.
+
+    Uses LayerNorm (not BatchNorm): it behaves identically in train/eval mode
+    and is robust to the small / uneven batch sizes common when fine-tuning, so
+    there is no train/eval statistics shift.
+    """
+
+    def __init__(self, in_dim: int, n_classes: int = 1, hidden_dim: int = 256,
+                 dropout: float = 0.2):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, n_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class TSClassifier(nn.Module):
+    """TSEncoder + ClassificationHead for supervised fine-tuning on a target.
+
+    n_classes == 1 -> binary; forward returns (B,) logits for BCEWithLogitsLoss.
+    n_classes  > 1 -> multiclass; forward returns (B, n_classes) for CrossEntropy.
+
+    Typical use: pretrain a TSEmbeddingModel contrastively, then
+    ``load_pretrained_encoder`` here and fine-tune end-to-end.
+    """
+
+    def __init__(self, encoder_cfg: TSEncoderConfig, n_classes: int = 1,
+                 head_hidden: int = 256, head_dropout: float = 0.2):
+        super().__init__()
+        self.cfg = encoder_cfg
+        self.n_classes = n_classes
+        self.encoder = TSEncoder(encoder_cfg)
+        self.head = ClassificationHead(encoder_cfg.d_model, n_classes,
+                                       head_hidden, head_dropout)
+
+    def encode(self, numeric_x, missing_mask, cat_x=None, time_keep_mask=None):
+        return self.encoder(numeric_x, missing_mask, cat_x, time_keep_mask)
+
+    def forward(self, numeric_x, missing_mask, cat_x=None, time_keep_mask=None):
+        z = self.encoder(numeric_x, missing_mask, cat_x, time_keep_mask)
+        logits = self.head(z)
+        return logits.squeeze(-1) if self.n_classes == 1 else logits
+
+    def load_pretrained_encoder(self, state_dict: dict, strict: bool = True):
+        """Load encoder weights from a pretrained checkpoint.
+
+        Accepts a full ``TSEmbeddingModel`` state_dict (keys prefixed
+        ``encoder.`` / ``projector.``) or a bare ``TSEncoder`` state_dict.
+        """
+        state = _strip_prefixes(state_dict)
+        enc = {k[len("encoder."):]: v for k, v in state.items()
+               if k.startswith("encoder.")}
+        if not enc:  # already a bare encoder state_dict
+            enc = {k: v for k, v in state.items()
+                   if not k.startswith("projector.")}
+        return self.encoder.load_state_dict(enc, strict=strict)
+
+    def set_encoder_trainable(self, flag: bool) -> None:
+        for p in self.encoder.parameters():
+            p.requires_grad = flag
+
+    def param_groups(self, encoder_lr: float, head_lr: float,
+                     weight_decay: float = 1e-4) -> list[dict]:
+        """Discriminative learning rates: a small LR for the pretrained encoder,
+        a larger LR for the freshly-initialised head."""
+        return [
+            {"params": self.encoder.parameters(), "lr": encoder_lr,
+             "weight_decay": weight_decay},
+            {"params": self.head.parameters(), "lr": head_lr,
+             "weight_decay": weight_decay},
+        ]
