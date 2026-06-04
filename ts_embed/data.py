@@ -300,3 +300,66 @@ class ContrastiveCollator:
             out["categorical_a"] = categorical
             out["categorical_b"] = categorical
         return out
+
+
+def aspect_preserving_view(
+    numeric: torch.Tensor,
+    missing: torch.Tensor,
+    categorical: torch.Tensor | None,
+    feature_group: torch.Tensor,
+    aspect_id: int,
+    mode: str = "shuffle",
+    noise_std: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Build a view that PRESERVES one semantic aspect's features and perturbs
+    the rest. Used for aspect-specific augmentation contrastive learning
+    (`AspectAugContrastiveLoss`).
+
+    The chunk that corresponds to `aspect_id` should be invariant between the
+    returned (perturbed) view and the original anchor view; the contrastive
+    loss enforces that geometry.
+
+    Args
+    ----
+    numeric        : (B, T, F) float -- imputed numeric features.
+    missing        : (B, T, F) float -- 1 where originally missing, 0 elsewhere.
+    categorical    : (B, T, F_cat) long or None. Kept INTACT in every mode --
+                     categorical features carry shared signal across aspects.
+    feature_group  : (F,) long -- `feature_group[i]` is the aspect id of
+                     numeric feature i.
+    aspect_id      : int -- the aspect to PRESERVE. All numeric features whose
+                     group != aspect_id are perturbed.
+    mode           : 'mask' | 'shuffle' | 'noise'
+        - 'mask'    : zero non-aspect numeric values and set their missing
+                      indicator to 1 (re-uses the encoder's missing pathway).
+        - 'shuffle' : permute non-aspect feature values across the batch
+                      dimension (each customer gets another customer's values
+                      for those features). Preserves marginal distributions.
+        - 'noise'   : add Gaussian noise scaled to each feature's std.
+
+    Returns (numeric_aug, missing_aug, categorical_aug).
+    """
+    other = feature_group != aspect_id   # (F,) bool, True where feature is OUTSIDE the preserved aspect
+    numeric = numeric.clone()
+    missing = missing.clone()
+
+    if mode == "mask":
+        numeric[..., other] = 0.0
+        missing[..., other] = 1.0
+    elif mode == "shuffle":
+        b = numeric.size(0)
+        perm = torch.randperm(b, device=numeric.device)
+        numeric[:, :, other] = numeric[perm][:, :, other]
+        missing[:, :, other] = missing[perm][:, :, other]
+    elif mode == "noise":
+        feat_std = numeric[..., other].std(dim=(0, 1), keepdim=True) + 1e-6
+        numeric[..., other] = (
+            numeric[..., other]
+            + noise_std * feat_std * torch.randn_like(numeric[..., other])
+        )
+    else:
+        raise ValueError(
+            f"unknown mode: {mode!r}; pick from 'mask', 'shuffle', 'noise'"
+        )
+
+    return numeric, missing, categorical

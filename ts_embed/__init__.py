@@ -14,6 +14,7 @@ from .loss import (
     StructuredContrastiveLoss,
     SemanticSpec,
     SupConLoss,
+    AspectAugContrastiveLoss,
     supcon_loss,
 )
 from .data import (
@@ -21,6 +22,7 @@ from .data import (
     ChunkedIterableDataset,
     ContrastiveCollator,
     TimeFeatureMasker,
+    aspect_preserving_view,
 )
 
 __all__ = [
@@ -37,9 +39,11 @@ __all__ = [
     "StructuredContrastiveLoss",
     "SemanticSpec",
     "SupConLoss",
+    "AspectAugContrastiveLoss",
     "supcon_loss",
     "TimeSeriesDataset",
     "ChunkedIterableDataset",
     "ContrastiveCollator",
     "TimeFeatureMasker",
+    "aspect_preserving_view",
 ]
